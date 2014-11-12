@@ -24,7 +24,6 @@
 #include <log/log.h>
 
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
-#define min(x, y) ((x) < (y) ? (x) : (y))
 
 static struct hw_module_methods_t memtrack_module_methods = {
     .open = NULL,
@@ -56,7 +55,7 @@ int aml_memtrack_init(const struct memtrack_module *module)
  * find the userid of process @pid
  * return the userid if success, or return -1 if not
  */
-int memtrack_find_userid(int pid)
+static int memtrack_find_userid(int pid)
 {
     FILE *fp;
     char line[1024];
@@ -81,11 +80,9 @@ int memtrack_find_userid(int pid)
     return -1;
 }
 
-unsigned int memtrack_get_gpuMem(int pid)
+static unsigned int memtrack_read_smaps(FILE *fp)
 {
-    FILE *fp;
     char line[1024];
-    char tmp[128];
     unsigned int size, sum = 0;
     int skip, done = 0;
 
@@ -94,16 +91,9 @@ unsigned int memtrack_get_gpuMem(int pid)
     char *name;
     int nameLen, name_pos;
 
-    sprintf(tmp, "/proc/%d/smaps", pid);
-    fp = fopen(tmp, "r");
-    if (fp == 0) {
-        ALOGD("open file %s error %s", tmp, strerror(errno));
+    if(fgets(line, sizeof(line), fp) == 0) {
         return 0;
-     }
-
-
-    if(fgets(line, sizeof(line), fp) == 0) 
-        return 0;
+    }
 
     while (!done) {
         skip = 0;
@@ -111,6 +101,7 @@ unsigned int memtrack_get_gpuMem(int pid)
         len = strlen(line);
         if (len < 1) 
             return 0;
+
         line[--len] = 0;
 
         if (sscanf(line, "%lx-%lx %*s %*x %*x:%*x %*d%n", &start, &end, &name_pos) != 2) {
@@ -155,8 +146,27 @@ unsigned int memtrack_get_gpuMem(int pid)
     // converted into Bytes
     return (sum * 1024);
 }
+
+static unsigned int memtrack_get_gpuMem(int pid)
+{
+    FILE *fp;
+    char tmp[128];
+    unsigned int result;
+
+    sprintf(tmp, "/proc/%d/smaps", pid);
+    fp = fopen(tmp, "r");
+    if (fp == NULL) {
+        ALOGD("open file %s error %s", tmp, strerror(errno));
+        return 0;
+     }
+
+    result = memtrack_read_smaps(fp);
+
+    fclose(fp);
+    return result; 
+}
     
-int memtrack_get_memory(pid_t pid, enum memtrack_type type,
+static int memtrack_get_memory(pid_t pid, enum memtrack_type type,
                              struct memtrack_record *records,
                              size_t *num_records)
 {
