@@ -22,6 +22,5 @@ LOCAL_MODULE_RELATIVE_PATH := hw
 LOCAL_C_INCLUDES += hardware/libhardware/include
 LOCAL_SHARED_LIBRARIES := liblog
 LOCAL_SRC_FILES := memtrack_aml.c
-#LOCAL_MODULE := memtrack.$(TARGET_BOARD_PLATFORM)
-LOCAL_MODULE := memtrack.amlogic
+LOCAL_MODULE := memtrack.$(TARGET_PRODUCT)
 include $(BUILD_SHARED_LIBRARY)
