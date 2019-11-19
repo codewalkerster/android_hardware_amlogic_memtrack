@@ -26,11 +26,13 @@
 #define DEBUG 0
 #define IONPATH "/d/ion/heaps"
 #define GPUT8X "/d/mali0/ctx"
+#define MALI0 "/d/mali0"
+#define MALI_DEVICE "/sys/devices/platform/ffe40000.bifrost"
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
 
 #define CHAR_BUFFER_SIZE        1024
 #define INIT_BUFS_ARRAY_SIZE    1024
-
+#define PAGE_SIZE               4096
 
 /**
  * Auxilary struct to keep information about single buffer.
@@ -241,18 +243,18 @@ static unsigned int memtrack_read_smaps(FILE *fp)
     return (sum * 1024);
 }
 
-static size_t read_pid_gl_memory(pid_t pid)
+static size_t read_pid_egl_memory(pid_t pid)
 {
     size_t unaccounted_size = 0;
     FILE *ion_fp;
     char tmp[CHAR_BUFFER_SIZE];
-    char gl_ion_dir[] = IONPATH;
+    char egl_ion_dir[] = IONPATH;
     struct dirent  *de;
     DIR *p_dir;
 
-    p_dir = opendir( gl_ion_dir );
+    p_dir = opendir( egl_ion_dir );
     if (!p_dir) {
-        ALOGD("fail to open %s\n", gl_ion_dir);
+        ALOGD("fail to open %s\n", egl_ion_dir);
         return 0;
     }
 
@@ -261,7 +263,7 @@ static size_t read_pid_gl_memory(pid_t pid)
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
             continue;
 
-        snprintf(tmp, CHAR_BUFFER_SIZE, "%s/%s", gl_ion_dir, de->d_name);
+        snprintf(tmp, CHAR_BUFFER_SIZE, "%s/%s", egl_ion_dir, de->d_name);
         if ((ion_fp = fopen(tmp, "r")) == NULL) {
             ALOGD("open file %s error %s", tmp, strerror(errno));
             closedir(p_dir);
@@ -392,6 +394,16 @@ static size_t read_pid_gl_memory(pid_t pid)
 
         //Free any memory used
         bufs_array_free(&bufs_array);
+    if (current_pids_bufs != NULL) {
+        free(current_pids_bufs);
+        current_pids_bufs = NULL;
+        current_pids_bufs_size = 0;
+    }
+    if (surface_flinger_bufs != NULL) {
+        free(surface_flinger_bufs);
+        surface_flinger_bufs = NULL;
+        surface_flinger_bufs_size = 0;
+    }
         fclose(ion_fp);
     }
 
@@ -400,6 +412,54 @@ static size_t read_pid_gl_memory(pid_t pid)
     return unaccounted_size;
 }
 
+static size_t read_egl_cached_memory(pid_t pid)
+{
+    size_t unaccounted_size = 0;
+    FILE *ion_fp;
+    char tmp[CHAR_BUFFER_SIZE];
+    char line[CHAR_BUFFER_SIZE];
+    char egl_ion_dir[] = IONPATH;
+
+    snprintf(tmp, CHAR_BUFFER_SIZE, "%s/%s", egl_ion_dir, "vmalloc_ion");
+    if ((ion_fp = fopen(tmp, "r")) == NULL) {
+        ALOGD("open file %s error %s", tmp, strerror(errno));
+        return -errno;
+    }
+
+    // Parse clients. Entries appear as follows:
+    //client(edf39c80)  allocator@2.0-s      pid(3226)
+    while (fgets(line, sizeof(line), ion_fp) != NULL) {
+        char     alloc_client[CHAR_BUFFER_SIZE];
+        pid_t    alloc_pid;
+        int      num_matched;
+
+        if (unaccounted_size > 0)
+            break;
+
+        num_matched = sscanf(line, "client(%*x) %1023s pid(%d)",
+                                    alloc_client, &alloc_pid);
+        if (num_matched == 2) {
+            if (pid == alloc_pid &&
+                strncmp(alloc_client, "allocator@2.0-s", sizeof(alloc_client)) == 0) {
+                while (fgets(line, sizeof(line), ion_fp) != NULL) {
+                    //Parse client's buffers lines, which look like this:
+                    //     total cached         68481024
+                    size_t buf_size;
+                    num_matched = sscanf(line, " total cached  %zu", &buf_size);
+                    if (num_matched == 1) {
+                        // We've found an entry ...
+                        unaccounted_size = buf_size;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    //close file fd
+    fclose(ion_fp);
+    return unaccounted_size;
+}
 
 // mali t82x t83x
 static int memtrack_get_gpuT8X(char *path)
@@ -415,19 +475,114 @@ static int memtrack_get_gpuT8X(char *path)
     }
 
     while (fgets(line, sizeof(line), file) != NULL) {
-            if (sscanf(line, "Total allocated memory:%d", &gpu_size) != 1)
+            if (sscanf(line, "%d %*d", &gpu_size) != 1)
                 continue;
             else
                 break;
     }
     fclose(file);
-    return gpu_size;
+    return gpu_size * PAGE_SIZE;
+}
+
+static size_t read_pid_gl_used_memory(pid_t pid)
+{
+    size_t unaccounted_size = 0;
+    FILE *ion_fp;
+    char tmp[CHAR_BUFFER_SIZE];
+    char line[CHAR_BUFFER_SIZE];
+    char gl_mem_dir[] = MALI0;
+
+    snprintf(tmp, CHAR_BUFFER_SIZE, "%s/%s", gl_mem_dir, "gpu_memory");
+    if ((ion_fp = fopen(tmp, "r")) == NULL) {
+        ALOGD("open file %s error %s", tmp, strerror(errno));
+        return -errno;
+    }
+
+    // Parse clients. Entries appear as follows:
+    //kctx             pid              used_pages
+    //----------------------------------------------------
+    //f0cd5000       4370       1511
+    while (fgets(line, sizeof(line), ion_fp) != NULL) {
+        pid_t    alloc_pid;
+        int      num_matched;
+        int      ctx_used_mem;
+
+        if (unaccounted_size > 0)
+            break;
+        num_matched = sscanf(line, "%*x %d %d", &alloc_pid, &ctx_used_mem);
+        if (num_matched == 2) {
+            if (pid == alloc_pid) {
+                unaccounted_size = ctx_used_mem;
+                fclose(ion_fp);
+                return unaccounted_size * PAGE_SIZE;
+            }
+        }
+    }
+    //close file fd
+    fclose(ion_fp);
+    return unaccounted_size * PAGE_SIZE;
+}
+
+static size_t read_gl_device_cached_memory(pid_t pid)
+{
+    size_t unaccounted_size = 0;
+    FILE *ion_fp = NULL;
+    char tmp[CHAR_BUFFER_SIZE];
+    char line[CHAR_BUFFER_SIZE];
+    char gl_ion_dir[] = IONPATH;
+    char gl_dev_dir[] = MALI_DEVICE;
+
+    snprintf(tmp, CHAR_BUFFER_SIZE, "%s/%s", gl_ion_dir, "vmalloc_ion");
+    if ((ion_fp = fopen(tmp, "r")) == NULL) {
+        ALOGD("open file %s error %s", tmp, strerror(errno));
+        return -errno;
+    }
+
+    // Parse clients. Entries appear as follows:
+    //client(edf39c80)  allocator@2.0-s      pid(3226)
+    while (fgets(line, sizeof(line), ion_fp) != NULL) {
+        char     alloc_client[CHAR_BUFFER_SIZE];
+        pid_t    alloc_pid;
+        int      num_matched;
+        FILE *fl_fp = NULL;
+
+        if (unaccounted_size > 0)
+            break;
+
+        num_matched = sscanf(line, "client(%*x) %1023s pid(%d)",
+                                    alloc_client, &alloc_pid);
+        if (num_matched == 2) {
+            if (pid == alloc_pid &&
+                strncmp(alloc_client, "allocator@2.0-s", sizeof(alloc_client)) == 0) {
+                snprintf(tmp, CHAR_BUFFER_SIZE, "%s/%s", gl_dev_dir, "mem_pool_size");
+                if ((fl_fp = fopen(tmp, "r")) == NULL) {
+                    return -errno;
+                }
+                // Entries appear as follows:
+                // 7610 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                size_t buf_size;
+                while (fgets(line, sizeof(line), fl_fp) != NULL) {
+                        if (sscanf(line, "%d %*d", &buf_size) != 1)
+                            continue;
+                        else {
+                            unaccounted_size = buf_size * PAGE_SIZE;
+                            fclose(fl_fp);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+    //close file fd
+    fclose(ion_fp);
+    return unaccounted_size;
 }
 
 static unsigned int memtrack_get_gpuMem(int pid)
 {
     FILE *fp;
-    char *cp, tmp[128];
+    char *cp, tmp[CHAR_BUFFER_SIZE];
     unsigned int result = 0;
 
     DIR *gpudir;
@@ -435,6 +590,7 @@ static unsigned int memtrack_get_gpuMem(int pid)
     int gpid = -1;
 
     gpudir = opendir(GPUT8X);
+
     if (!gpudir) {
         if (DEBUG)
             ALOGD("open %s error %s\n", GPUT8X, strerror(errno));
@@ -449,16 +605,18 @@ static unsigned int memtrack_get_gpuMem(int pid)
         fclose(fp);
         return result;
     } else {
+        result = read_pid_gl_used_memory(pid);
+        result += read_gl_device_cached_memory(pid);
         while ((dir = readdir(gpudir))) {
             strcpy(tmp, dir->d_name);
-            ALOGD("dir name=%s\n", dir->d_name);
+            ALOGD("gpudir name=%s\n", dir->d_name);
             if ((cp=strchr(tmp, '_'))) {
                 *cp = '\0';
                 gpid = atoi(tmp);
                 ALOGD("gpid=%d, pid=%d\n", gpid, pid);
                 if (gpid == pid) {
-                    sprintf(tmp, GPUT8X"/%s/%s", dir->d_name, "mem_profile");
-                    result = memtrack_get_gpuT8X(tmp);
+                    sprintf(tmp, GPUT8X"/%s/%s", dir->d_name, "mem_pool_size");
+                    result += memtrack_get_gpuT8X(tmp);
                     closedir(gpudir);
                     return result;
                 }
@@ -466,7 +624,7 @@ static unsigned int memtrack_get_gpuMem(int pid)
         }
         closedir(gpudir);
     }
-    return 0;
+    return result;
 }
 
 static int memtrack_get_memory(pid_t pid, enum memtrack_type type,
@@ -483,8 +641,6 @@ static int memtrack_get_memory(pid_t pid, enum memtrack_type type,
 
     unsigned int gpu_size;
 
-
-   // ALOGD("type is %d, pid is %d\n", type, pid);
     size_t allocated_records =  ARRAY_SIZE(record_templates);
     *num_records = ARRAY_SIZE(record_templates);
 
@@ -503,8 +659,9 @@ static int memtrack_get_memory(pid_t pid, enum memtrack_type type,
         gpu_size = memtrack_get_gpuMem(pid);
         unaccounted_size += gpu_size;
     } else if (type == MEMTRACK_TYPE_GRAPHICS) {
-        unaccounted_size += read_pid_gl_memory(pid);
-
+        unaccounted_size += read_pid_egl_memory(pid);
+    } else if (type == MEMTRACK_TYPE_OTHER) {
+        unaccounted_size += read_egl_cached_memory(pid);
     }
 
     if (allocated_records > 0) {
@@ -521,11 +678,11 @@ int aml_memtrack_get_memory(const struct memtrack_module *module __unused,
                                 struct memtrack_record *records,
                                 size_t *num_records)
 {
-    ALOGD("%s, %d\n", __func__, __LINE__);
     if (pid <= 0)
         return -EINVAL;
 
-    if (type == MEMTRACK_TYPE_GL || type == MEMTRACK_TYPE_GRAPHICS)
+    if (type == MEMTRACK_TYPE_GL || type == MEMTRACK_TYPE_GRAPHICS
+        || type == MEMTRACK_TYPE_OTHER)
         return memtrack_get_memory(pid, type, records, num_records);
     else
         return -ENODEV;
