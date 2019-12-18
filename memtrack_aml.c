@@ -247,6 +247,7 @@ static size_t read_pid_egl_memory(pid_t pid)
 {
     size_t unaccounted_size = 0;
     FILE *ion_fp;
+    FILE *egl_fp;
     char tmp[CHAR_BUFFER_SIZE];
     char egl_ion_dir[] = IONPATH;
     struct dirent  *de;
@@ -269,7 +270,12 @@ static size_t read_pid_egl_memory(pid_t pid)
             closedir(p_dir);
             return -errno;
         }
-
+        if ((egl_fp = fopen(tmp, "r")) == NULL) {
+            ALOGD("open file %s error %s", tmp, strerror(errno));
+            fclose(ion_fp);
+            closedir(p_dir);
+            return -errno;
+        }
         //Parse bufs. Entries appear as follows:
         //buf= ece0a300 heap_id= 4    size= 8486912    kmap= 0    dmap= 0
         int num_entries_found = 0;
@@ -316,7 +322,7 @@ static size_t read_pid_egl_memory(pid_t pid)
             if (need_to_rescan == 1) {
                 need_to_rescan = 0;
             } else {
-                if (fgets(line, sizeof(line), ion_fp) == NULL) {
+                if (fgets(line, sizeof(line), egl_fp) == NULL) {
                     break;
                 }
             }
@@ -345,7 +351,7 @@ static size_t read_pid_egl_memory(pid_t pid)
                     // handle= ecf9da00     buf= ecf1d600 heap_id= 4    size= 8486912
 
                     uint64_t buf_id;
-                    if (fgets(line, sizeof(line), ion_fp) == NULL) {
+                    if (fgets(line, sizeof(line), egl_fp) == NULL) {
                         break;
                     }
                     num_matched = sscanf(line, " handle= %*x buf= %llx %*s %*d %*s %*u", &buf_id);
@@ -394,17 +400,18 @@ static size_t read_pid_egl_memory(pid_t pid)
 
         //Free any memory used
         bufs_array_free(&bufs_array);
-    if (current_pids_bufs != NULL) {
-        free(current_pids_bufs);
-        current_pids_bufs = NULL;
-        current_pids_bufs_size = 0;
-    }
-    if (surface_flinger_bufs != NULL) {
-        free(surface_flinger_bufs);
-        surface_flinger_bufs = NULL;
-        surface_flinger_bufs_size = 0;
-    }
-        fclose(ion_fp);
+        if (current_pids_bufs != NULL) {
+            free(current_pids_bufs);
+            current_pids_bufs = NULL;
+            current_pids_bufs_size = 0;
+        }
+        if (surface_flinger_bufs != NULL) {
+            free(surface_flinger_bufs);
+            surface_flinger_bufs = NULL;
+            surface_flinger_bufs_size = 0;
+        }
+            fclose(ion_fp);
+            fclose(egl_fp);
     }
 
     closedir(p_dir);
@@ -609,11 +616,13 @@ static unsigned int memtrack_get_gpuMem(int pid)
         result += read_gl_device_cached_memory(pid);
         while ((dir = readdir(gpudir))) {
             strcpy(tmp, dir->d_name);
-            ALOGD("gpudir name=%s\n", dir->d_name);
+            if (DEBUG)
+                ALOGD("gpudir name=%s\n", dir->d_name);
             if ((cp=strchr(tmp, '_'))) {
                 *cp = '\0';
                 gpid = atoi(tmp);
-                ALOGD("gpid=%d, pid=%d\n", gpid, pid);
+                if (DEBUG)
+                    ALOGD("gpid=%d, pid=%d\n", gpid, pid);
                 if (gpid == pid) {
                     sprintf(tmp, GPUT8X"/%s/%s", dir->d_name, "mem_pool_size");
                     result += memtrack_get_gpuT8X(tmp);
@@ -666,7 +675,8 @@ static int memtrack_get_memory(pid_t pid, enum memtrack_type type,
 
     if (allocated_records > 0) {
         records[0].size_in_bytes = unaccounted_size;
-       // ALOGD("graphic %u\n", unaccounted_size);
+        if (DEBUG)
+            ALOGD("Graphics type:%d unaccounted_size:%u\n", type, unaccounted_size);
     }
 
     return 0;
