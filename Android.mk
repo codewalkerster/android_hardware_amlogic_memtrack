@@ -26,6 +26,7 @@ LOCAL_C_INCLUDES += \
 
 LOCAL_SHARED_LIBRARIES := liblog
 LOCAL_SRC_FILES := memtrack_aml.c
+LOCAL_CFLAGS := -Wno-error=format
 #LOCAL_MODULE := memtrack.$(TARGET_BOARD_PLATFORM)
 LOCAL_MODULE := memtrack.$(TARGET_PRODUCT)
 ifeq ($(shell test $(PLATFORM_SDK_VERSION) -ge 26 && echo OK),OK)
